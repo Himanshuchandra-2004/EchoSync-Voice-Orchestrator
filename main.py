@@ -133,6 +133,10 @@ async def ws_endpoint(websocket: WebSocket):
     stt = WhisperSTT(on_transcript=on_transcript)
     await stt.connect()
 
+    # Pre-connect TTS WebSocket in the background so the first sentence doesn't pay handshake latency
+    if hasattr(tts, "connect"):
+        asyncio.create_task(tts.connect())
+
     try:
         while True:
             message = await websocket.receive()

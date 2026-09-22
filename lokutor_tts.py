@@ -6,6 +6,7 @@ Designed for real-time voice agent pipelines.
 Audio format: Int16 PCM, 44.1 kHz, mono
 WebSocket: wss://api.lokutor.com/ws/tts
 """
+import asyncio
 import json
 import logging
 import os
@@ -27,23 +28,58 @@ class LokutorTTS:
         if not api_key:
             raise RuntimeError("LOKUTOR_API_KEY is not set")
         self._api_key = api_key
-        self._ws_url = f"wss://api.lokutor.com/ws/tts?api_key={api_key}"
+        self._ws_url = "wss://api.lokutor.com/ws/tts"
         self._ws = None
+        self._connect_lock = asyncio.Lock()
         self._voice = os.environ.get("LOKUTOR_VOICE", DEFAULT_VOICE)
         self._language = os.environ.get("LOKUTOR_LANGUAGE", DEFAULT_LANGUAGE)
         self._speed = float(os.environ.get("LOKUTOR_SPEED", DEFAULT_SPEED))
         self._steps = int(os.environ.get("LOKUTOR_STEPS", DEFAULT_STEPS))
 
+    def _is_connected(self) -> bool:
+        if self._ws is None:
+            return False
+        # websockets < 14 had .closed attribute
+        if hasattr(self._ws, "closed"):
+            return not self._ws.closed
+        # websockets 14+ removed .closed in favor of .state (State.OPEN)
+        if hasattr(self._ws, "state"):
+            return getattr(self._ws.state, "name", "") == "OPEN"
+        return True
+
+    async def connect(self):
+        """Pre-connect to Lokutor WebSocket so first synthesis request is warm."""
+        try:
+            await self._ensure_connection()
+        except Exception as e:
+            log.warning("Lokutor pre-connect failed (%s); will retry on first sentence", e)
+
     async def _ensure_connection(self):
         """Open or reuse a persistent WebSocket connection."""
-        if self._ws is None or self._ws.closed:
+        if self._is_connected():
+            return
+        async with self._connect_lock:
+            if self._is_connected():
+                return
             log.info("connecting to Lokutor WebSocket…")
-            self._ws = await websockets.connect(
-                self._ws_url,
-                max_size=2**20,  # 1 MB max frame
-                ping_interval=20,
-                ping_timeout=10,
-            )
+            headers = {"X-API-Key": self._api_key}
+            connect_kwargs = {
+                "max_size": 2**20,  # 1 MB max frame
+                "ping_interval": 20,
+                "ping_timeout": 10,
+            }
+            try:
+                self._ws = await websockets.connect(
+                    self._ws_url,
+                    additional_headers=headers,
+                    **connect_kwargs,
+                )
+            except TypeError:
+                self._ws = await websockets.connect(
+                    self._ws_url,
+                    extra_headers=headers,
+                    **connect_kwargs,
+                )
             log.info("Lokutor WebSocket connected")
 
     async def stream_sentence(self, text: str, lang: str | None = None):
@@ -110,7 +146,11 @@ class LokutorTTS:
 
     async def close(self):
         """Close the persistent WebSocket connection."""
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-            log.info("Lokutor WebSocket closed")
+        ws = self._ws
         self._ws = None
+        if ws is not None:
+            try:
+                await ws.close()
+                log.info("Lokutor WebSocket closed")
+            except Exception:
+                pass
