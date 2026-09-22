@@ -450,28 +450,97 @@ const viz    = document.getElementById('viz');
 
 // State
 let ws, audioCtx, micStream, proc, src, running = false;
-let audioQueue = [], curChunks = [], collecting = false, playing = false, agentTalking = false;
+let curChunks = [], collecting = false, playing = false, agentTalking = false;
+let curAudioFormat = 'mp3'; // 'mp3' or 'pcm' — set by server's audio_start message
 
-function setStatus(cls, txt) { badge.className = 'badge ' + cls; badgeTxt.textContent = txt; }
+// ---- MP3 playback queue (legacy Edge TTS path) ----
+let mp3Queue = [];
 
-// Audio queue
-function enqueue() {
+function enqueueMp3() {
   if (!curChunks.length) return;
-  audioQueue.push(URL.createObjectURL(new Blob(curChunks, { type: 'audio/mpeg' })));
+  mp3Queue.push(URL.createObjectURL(new Blob(curChunks, { type: 'audio/mpeg' })));
   curChunks = [];
-  playNext();
+  playNextMp3();
 }
 
-function playNext() {
-  if (playing || !audioQueue.length) return;
+function playNextMp3() {
+  if (playing || !mp3Queue.length) return;
   playing = true;
   agentTalking = true;
   setStatus('speak', 'Speaking…');
-  const a = new Audio(audioQueue.shift());
+  const a = new Audio(mp3Queue.shift());
   a.playbackRate = 1.15;
-  a.onended = () => { playing = false; if (!audioQueue.length) { agentTalking = false; if (running) setStatus('listen','Listening…'); } playNext(); };
+  a.onended = () => {
+    playing = false;
+    if (!mp3Queue.length) { agentTalking = false; if (running) setStatus('listen','Listening…'); }
+    playNextMp3();
+  };
   a.play().catch(() => { playing = false; });
 }
+
+// ---- PCM16 playback (Lokutor path — gapless via Web Audio API) ----
+let pcmPlayCtx = null;   // AudioContext for TTS playback (separate from mic)
+let pcmNextTime = 0;     // schedule cursor for gapless PCM chunks
+let pcmPendingSources = 0;
+
+function ensurePcmCtx() {
+  if (!pcmPlayCtx || pcmPlayCtx.state === 'closed') {
+    pcmPlayCtx = new AudioContext({ sampleRate: 44100 });
+  }
+  return pcmPlayCtx;
+}
+
+function playPcmChunk(arrayBuf) {
+  const ctx = ensurePcmCtx();
+  const int16 = new Int16Array(arrayBuf);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768;
+  }
+
+  const buffer = ctx.createBuffer(1, float32.length, 44100);
+  buffer.getChannelData(0).set(float32);
+
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+
+  const startAt = Math.max(ctx.currentTime, pcmNextTime);
+  source.start(startAt);
+  pcmNextTime = startAt + buffer.duration;
+
+  agentTalking = true;
+  playing = true;
+  setStatus('speak', 'Speaking…');
+
+  pcmPendingSources++;
+  source.onended = () => {
+    pcmPendingSources--;
+    if (pcmPendingSources <= 0) {
+      pcmPendingSources = 0;
+      playing = false;
+      agentTalking = false;
+      if (running) setStatus('listen', 'Listening…');
+    }
+  };
+}
+
+function resetPcmScheduler() {
+  pcmNextTime = 0;
+  pcmPendingSources = 0;
+}
+
+// ---- Enqueue dispatcher ----
+function enqueue() {
+  if (curAudioFormat === 'pcm') {
+    // PCM chunks were already played in real-time via playPcmChunk
+    curChunks = [];
+    return;
+  }
+  enqueueMp3();
+}
+
+function setStatus(cls, txt) { badge.className = 'badge ' + cls; badgeTxt.textContent = txt; }
 
 // Messages
 function addMsg(text, cls, interim) {
@@ -502,7 +571,7 @@ function showDots() {
 
 function hideDots() { const e = document.getElementById('dots'); if (e) e.remove(); }
 
-// Audio helpers
+// Audio helpers — mic downsampling to 16 kHz Int16 for Whisper STT
 function ds16k(f32, rate) {
   const r = rate / 16000, n = Math.floor(f32.length / r), out = new Int16Array(n);
   for (let i = 0; i < n; i++) {
@@ -548,14 +617,27 @@ async function start() {
       const m = JSON.parse(ev.data);
       switch (m.type) {
         case 'user_transcript': if (m.final) { clearTmp(); addMsg(m.text,'user',false); } else addMsg(m.text,'user',true); break;
-        case 'agent_start': showDots(); setStatus('think','Thinking…'); break;
+        case 'agent_start': showDots(); setStatus('think','Thinking…'); resetPcmScheduler(); break;
         case 'agent_text': hideDots(); addMsg(m.text,'agent',false); break;
         case 'agent_end': hideDots(); if (!agentTalking && running) setStatus('listen','Listening…'); break;
-        case 'audio_start': collecting = true; curChunks = []; break;
+        case 'audio_start':
+          collecting = true;
+          curChunks = [];
+          curAudioFormat = m.format || 'mp3';
+          break;
         case 'audio_end': collecting = false; enqueue(); break;
         case 'error': hideDots(); addMsg(m.text,'agent',false); break;
       }
-    } else { if (collecting) curChunks.push(ev.data); }
+    } else {
+      if (collecting) {
+        if (curAudioFormat === 'pcm') {
+          // Play PCM chunks immediately for lowest latency
+          playPcmChunk(ev.data);
+        } else {
+          curChunks.push(ev.data);
+        }
+      }
+    }
   };
 
   ws.onclose = () => { setStatus('','Disconnected'); stop(); };

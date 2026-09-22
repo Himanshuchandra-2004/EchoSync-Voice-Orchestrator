@@ -3,14 +3,18 @@ EchoSync Voice Orchestrator
 
 Browser mic audio --> FastAPI WebSocket --> Groq Whisper (STT)
                                         --> Groq (LLM, streamed, sentence-chunked)
-                                        --> Edge TTS (streamed)
+                                        --> Lokutor TTS (streamed, PCM16) [primary]
+                                        --> Edge TTS (streamed, MP3)       [fallback]
                                         --> back to browser for playback
+
+Set TTS_ENGINE=lokutor (default) or TTS_ENGINE=edge in your .env
 
 Run with:  uvicorn main:app --reload
 """
 import asyncio
 import json
 import logging
+import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -18,12 +22,26 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from whisper_stt import WhisperSTT
-from edge_tts_wrapper import EdgeTTS
 from groq_llm import GroqLLM
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("voice-agent")
+
+# ---------- TTS engine selection ----------
+TTS_ENGINE = os.environ.get("TTS_ENGINE", "lokutor").lower()
+
+if TTS_ENGINE == "lokutor":
+    try:
+        from lokutor_tts import LokutorTTS
+        log.info("TTS engine: Lokutor (PCM16 @ 44.1 kHz)")
+    except Exception as e:
+        log.warning("Lokutor TTS unavailable (%s), falling back to Edge TTS", e)
+        TTS_ENGINE = "edge"
+
+if TTS_ENGINE == "edge":
+    from edge_tts_wrapper import EdgeTTS
+    log.info("TTS engine: Edge TTS (MP3)")
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -61,7 +79,8 @@ async def ws_endpoint(websocket: WebSocket):
             pass  # connection already closed
 
     llm = GroqLLM()
-    tts = EdgeTTS()
+    tts = LokutorTTS() if TTS_ENGINE == "lokutor" else EdgeTTS()
+    audio_format = "pcm" if TTS_ENGINE == "lokutor" else "mp3"
 
     # Guards against overlapping replies if the user talks again before
     # the agent finishes speaking.
@@ -91,7 +110,7 @@ async def ws_endpoint(websocket: WebSocket):
                         sentence = await sentence_queue.get()
                         if sentence is None:
                             break
-                        await send_json({"type": "audio_start"})
+                        await send_json({"type": "audio_start", "format": audio_format})
                         async for audio_chunk in tts.stream_sentence(sentence, lang=detected_lang):
                             await send_audio(audio_chunk)
                         await send_json({"type": "audio_end"})
